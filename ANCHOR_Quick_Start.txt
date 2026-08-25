@@ -1,0 +1,20 @@
+ANCHOR Quick Start
+==================
+
+1. Create and activate a Python virtual environment.
+2. Install dependencies:
+   python -m pip install numpy pandas matplotlib scipy openpyxl
+3. Test Tkinter:
+   python -m tkinter
+4. Launch ANCHOR:
+   python ANCHOR.py
+5. Select the CSV, output folder, S0/E0, and concentration groups.
+6. Choose an analysis mode.
+7. Run fitting and begin with ANCHOR_key_results.csv.
+
+Example modes
+-------------
+Normal: General automatic model selection; validated defaults.
+MM: Known reversible MM only; MM post-fit enabled.
+No-binding: General automatic; no-binding enabled.
+Known-binder linear: Custom; linear-only enabled; no-binding disabled.

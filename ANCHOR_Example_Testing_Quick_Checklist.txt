@@ -1,0 +1,33 @@
+ANCHOR EXAMPLE TESTING QUICK CHECKLIST
+
+1. DEFAULT MODEL
+File: examples/Default Model/Imipenem_LdtB.csv
+E0: 5.0 uM
+Groups: 50 uM x 9; 200 uM x 9
+Mode: General automatic model selection
+Critical setting: Leave fitting defaults unchanged.
+Recommended: MM post-fit output OFF for a cleaner trace-level test.
+
+2. KNOWN-BINDING LINEAR
+File: examples/Linear Binding/10a_Ldtb.csv
+E0: 5.0 uM
+Groups: 50 uM x 9; 200 uM x 9
+Mode: Custom advanced settings
+Critical setting: Disable no-binding; keep linear-only enabled.
+Recommended: MM post-fit output OFF.
+
+3. NO BINDING
+File: examples/No Binding/WR-2-36Normalized.csv
+E0: 5.0 uM
+Group: 200 uM x 3
+Mode: General automatic model selection
+Critical setting: Keep no-binding enabled.
+Recommended: MM post-fit output OFF.
+
+4. REVERSIBLE MM
+File: examples/MM Fitting/SPpNA_Fitting_All.csv
+E0: 40.0 uM
+Groups in trace-column order:
+4500 x 1, 3150 x 1, 2250 x 1, 1350 x 1, 675 x 1, 360 x 1 uM
+Mode: Known reversible MM only: S + D <-> SD -> S + P
+Critical setting: MM post-fit output ON.

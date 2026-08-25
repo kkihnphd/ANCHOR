@@ -1,0 +1,6 @@
+# ANCHOR Python dependencies
+numpy
+pandas
+matplotlib
+scipy
+openpyxl
