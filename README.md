@@ -14,14 +14,14 @@ ANCHOR combines bounded multistart optimization, numerical ODE integration, robu
 - Slow-engagement kinetic models
 - Direct turnover model:
 
-  \[
-  E + S \rightarrow P
-  \]
+  [
+  E + S -> P
+  ]
 
 - Reversible Michaelis-Menten turnover model:
 
   \[
-  E + S \rightleftharpoons ES \rightarrow P
+  E + S <-> ES -> E + P
   \]
 
 - Linear-only and no-binding diagnostic models
