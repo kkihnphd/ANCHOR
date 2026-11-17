@@ -51,6 +51,26 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 
+# User-facing unit choices. ANCHOR converts all time values to minutes and all
+# concentrations to micromolar/millimolar internally so the kinetic equations
+# and historical output columns remain backward compatible.
+TIME_UNIT_TO_MIN = {
+    "seconds": 1.0 / 60.0,
+    "minutes": 1.0,
+}
+
+CONCENTRATION_UNIT_TO_UM = {
+    "nM": 1.0e-3,
+    "µM": 1.0,
+    "uM": 1.0,  # accepted for backward-compatible JSON/config files
+    "mM": 1.0e3,
+    "M": 1.0e6,
+}
+
+GUI_CONCENTRATION_UNITS = ("nM", "µM", "mM", "M")
+GUI_TIME_UNITS = ("seconds", "minutes")
+
+
 ##############################################################################
 # CONFIGURATION OBJECTS
 ##############################################################################
@@ -72,6 +92,12 @@ class FittingConfig:
         default_factory=lambda: [ConcentrationGroup(50.0, 9), ConcentrationGroup(200.0, 9)]
     )
     E0_uM: float = 5.0
+
+    # User-facing input units. Values are converted to canonical internal units:
+    # time -> minutes; concentrations -> µM (and mM where required by ODEs).
+    input_time_unit: str = "minutes"
+    enzyme_concentration_unit: str = "µM"
+    substrate_concentration_unit: str = "µM"
 
     # High-level analysis mode. The GUI uses this to keep routine workflows
     # simple while preserving full manual control in custom mode.
@@ -162,7 +188,7 @@ class FittingConfig:
     response_max: float = 3.0
 
     # Reversible Michaelis-Menten turnover model bounds
-    # Mechanism: E + S <-> ES -> P. Units use minutes and millimolar.
+    # Mechanism: E + S <-> ES -> P. Internal units use minutes and millimolar.
     mm_kon_min: float = 1e-8
     mm_kon_max: float = 1e6
     mm_kon_initial_guess: float = 10.0
@@ -194,6 +220,34 @@ class FittingConfig:
     def E0_mM(self) -> float:
         return self.E0_uM / 1000.0
 
+    @staticmethod
+    def normalize_concentration_unit(unit: str) -> str:
+        unit = str(unit or "µM").strip()
+        if unit == "uM":
+            return "µM"
+        return unit
+
+    @staticmethod
+    def concentration_to_uM(value: float, unit: str) -> float:
+        unit_key = str(unit or "µM").strip()
+        if unit_key not in CONCENTRATION_UNIT_TO_UM:
+            raise ValueError(f"Unsupported concentration unit: {unit}")
+        return float(value) * CONCENTRATION_UNIT_TO_UM[unit_key]
+
+    @staticmethod
+    def concentration_from_uM(value_uM: float, unit: str) -> float:
+        unit_key = str(unit or "µM").strip()
+        if unit_key not in CONCENTRATION_UNIT_TO_UM:
+            raise ValueError(f"Unsupported concentration unit: {unit}")
+        return float(value_uM) / CONCENTRATION_UNIT_TO_UM[unit_key]
+
+    @staticmethod
+    def time_to_minutes(values: np.ndarray, unit: str) -> np.ndarray:
+        unit_key = str(unit or "minutes").strip().lower()
+        if unit_key not in TIME_UNIT_TO_MIN:
+            raise ValueError(f"Unsupported time unit: {unit}")
+        return np.asarray(values, dtype=float) * TIME_UNIT_TO_MIN[unit_key]
+
     @property
     def D_values_uM(self) -> List[float]:
         values: List[float] = []
@@ -224,6 +278,16 @@ class FittingConfig:
             elif isinstance(item, dict):
                 groups.append(ConcentrationGroup(**item))
         clean_data["concentration_groups"] = groups or cls().concentration_groups
+
+        # Older setup files did not store unit preferences. They therefore
+        # retain the historical defaults of minutes and micromolar.
+        clean_data["input_time_unit"] = str(clean_data.get("input_time_unit", "minutes")).lower()
+        clean_data["enzyme_concentration_unit"] = cls.normalize_concentration_unit(
+            clean_data.get("enzyme_concentration_unit", "µM")
+        )
+        clean_data["substrate_concentration_unit"] = cls.normalize_concentration_unit(
+            clean_data.get("substrate_concentration_unit", "µM")
+        )
 
         valid_fields = set(cls.__dataclass_fields__.keys())
         clean_data = {key: value for key, value in clean_data.items() if key in valid_fields}
@@ -398,6 +462,23 @@ class StoppedFlowFitter:
             raise ValueError("Output folder name must be a single folder name and cannot contain path separators or invalid filename characters.")
         if self.cfg.E0_uM <= 0:
             raise ValueError("E0 must be greater than zero.")
+
+        time_unit = str(getattr(self.cfg, "input_time_unit", "minutes") or "minutes").lower()
+        if time_unit not in TIME_UNIT_TO_MIN:
+            raise ValueError("Input time unit must be 'seconds' or 'minutes'.")
+        self.cfg.input_time_unit = time_unit
+
+        self.cfg.enzyme_concentration_unit = FittingConfig.normalize_concentration_unit(
+            getattr(self.cfg, "enzyme_concentration_unit", "µM")
+        )
+        self.cfg.substrate_concentration_unit = FittingConfig.normalize_concentration_unit(
+            getattr(self.cfg, "substrate_concentration_unit", "µM")
+        )
+        if self.cfg.enzyme_concentration_unit not in GUI_CONCENTRATION_UNITS:
+            raise ValueError("Enzyme concentration unit must be nM, µM, mM, or M.")
+        if self.cfg.substrate_concentration_unit not in GUI_CONCENTRATION_UNITS:
+            raise ValueError("Substrate/reactant concentration unit must be nM, µM, mM, or M.")
+
         valid_analysis_modes = {"general_auto", "turnover_auto", "direct_only", "reversible_mm_only", "custom"}
         if str(getattr(self.cfg, "analysis_mode", "general_auto")) not in valid_analysis_modes:
             raise ValueError(f"Unknown analysis mode: {self.cfg.analysis_mode}")
@@ -730,8 +811,8 @@ class StoppedFlowFitter:
         """Return the ordinary least-squares slope of y versus time.
 
         Time is centered at the first fitted point so the returned slope has
-        units of y-units per input time unit. ANCHOR assumes time is supplied in
-        minutes throughout the fitting workflow.
+        units of y-units per minute. CSV time values may be supplied in seconds
+        or minutes; ANCHOR converts them to minutes before this routine is called.
         """
         t = np.asarray(time_values, dtype=float)
         y = np.asarray(y_values, dtype=float)
@@ -1229,6 +1310,13 @@ class StoppedFlowFitter:
             "n_fit_points": n_fit,
             "n_unique_concentrations": int(np.unique(fit_x).size),
             "E0_uM": float(self.cfg.E0_uM),
+            "E0_input_value": self.cfg.concentration_from_uM(
+                self.cfg.E0_uM, self.cfg.enzyme_concentration_unit
+            ),
+            "E0_input_unit": self.cfg.enzyme_concentration_unit,
+            "substrate_input_unit": self.cfg.substrate_concentration_unit,
+            "input_time_unit": self.cfg.input_time_unit,
+            "internal_time_unit": "minutes",
             "Vmax_raw_units_per_s": Vmax,
             "Vmax_se_raw_units_per_s": Vmax_se,
             "Vmax_raw_units_per_min": Vmax * 60.0,
@@ -1406,7 +1494,11 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
                 pd.DataFrame(
                     [
                         {"Item": "Analysis mode", "Value": getattr(self.cfg, "analysis_mode", "unknown")},
+                        {"Item": "Input time unit", "Value": self.cfg.input_time_unit},
+                        {"Item": "Internal time unit", "Value": "minutes"},
                         {"Item": "E0_uM", "Value": self.cfg.E0_uM},
+                        {"Item": "E0 input unit", "Value": self.cfg.enzyme_concentration_unit},
+                        {"Item": "Substrate/reactant input unit", "Value": self.cfg.substrate_concentration_unit},
                         {"Item": "Notes", "Value": "Use Key Results first. Detailed candidate fits are in Model Selection."},
                     ]
                 ).to_excel(writer, sheet_name="README", index=False)
@@ -2327,11 +2419,15 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
         self.log(f"Reading CSV: {self.cfg.input_csv}")
         df = pd.read_csv(self.cfg.input_csv)
 
-        time_raw = df.iloc[:, 0].values
-        data_raw = df.iloc[:, 1:].values
+        try:
+            time_raw = pd.to_numeric(df.iloc[:, 0], errors="raise").to_numpy(dtype=float)
+        except Exception as exc:
+            raise ValueError("The first CSV column must contain numeric time values.") from exc
+        data_raw = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
         sort_idx = np.argsort(time_raw)
-        time = time_raw[sort_idx]
+        time_input = time_raw[sort_idx]
+        time = self.cfg.time_to_minutes(time_input, self.cfg.input_time_unit)
         data = data_raw[sort_idx, :]
         time = time - time[0]
 
@@ -2351,6 +2447,15 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
 
         total_runs = data.shape[1]
         self.log(f"Output folder: {self.cfg.output_dir}")
+        self.log(
+            f"Input time unit: {self.cfg.input_time_unit}; "
+            "time is converted internally to minutes for fitting and rate constants."
+        )
+        self.log(
+            f"Concentration input units: E0 in {self.cfg.enzyme_concentration_unit}; "
+            f"substrate/reactant in {self.cfg.substrate_concentration_unit}. "
+            "Concentrations are converted internally to µM/mM."
+        )
         self.log(f"Detected {total_runs} traces across {len(self.cfg.concentration_groups)} concentration(s).")
         if self.cfg.fit_zero_intermediate_only:
             self.log("Direct-only mode active: fitting only E + S -> P, with n_intermediates = 0.")
@@ -2364,7 +2469,12 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
         for run_idx in range(total_runs):
             self.check_cancelled()
             D_uM = D_values_uM[run_idx]
-            self.log(f"Fitting run {run_idx + 1}/{total_runs} at {D_uM:g} µM")
+            D_display = self.cfg.concentration_from_uM(D_uM, self.cfg.substrate_concentration_unit)
+            self.log(
+                f"Fitting run {run_idx + 1}/{total_runs} at "
+                f"{D_display:g} {self.cfg.substrate_concentration_unit} "
+                f"({D_uM:g} µM internal)"
+            )
 
             y_norm = self.normalize_trace(data[:, run_idx], time)
             y_raw_fit = y_norm[fit_mask]
@@ -2704,6 +2814,13 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
                 self.progress_callback(run_idx + 1, total_runs)
 
         model_summary_df = pd.DataFrame(model_summary)
+        if not model_summary_df.empty and "D_uM" in model_summary_df.columns:
+            model_summary_df["S_input_value"] = model_summary_df["D_uM"].apply(
+                lambda value: self.cfg.concentration_from_uM(value, self.cfg.substrate_concentration_unit)
+            )
+            model_summary_df["S_input_unit"] = self.cfg.substrate_concentration_unit
+            model_summary_df["input_time_unit"] = self.cfg.input_time_unit
+            model_summary_df["internal_time_unit"] = "minutes"
         model_summary_output = model_summary_df.rename(columns={"D_uM": "S_uM"})
         model_summary_output.to_csv(
             os.path.join(self.cfg.output_dir, "model_selection_summary.csv"),
@@ -2714,9 +2831,21 @@ Analysis mode used: {getattr(self.cfg, 'analysis_mode', 'unknown')}
 
         for run_idx, best_record in enumerate(best_fits):
             best_fit = best_record["fit"]
+            D_uM_current = float(D_values_uM[run_idx])
             row: Dict[str, Any] = {
                 "Run": run_idx + 1,
-                "D_uM": D_values_uM[run_idx],
+                "D_uM": D_uM_current,
+                "S_input_value": self.cfg.concentration_from_uM(
+                    D_uM_current, self.cfg.substrate_concentration_unit
+                ),
+                "S_input_unit": self.cfg.substrate_concentration_unit,
+                "E0_uM": float(self.cfg.E0_uM),
+                "E0_input_value": self.cfg.concentration_from_uM(
+                    self.cfg.E0_uM, self.cfg.enzyme_concentration_unit
+                ),
+                "E0_input_unit": self.cfg.enzyme_concentration_unit,
+                "input_time_unit": self.cfg.input_time_unit,
+                "internal_time_unit": "minutes",
                 "model_type": best_record["model_type"],
                 "fit_mode": best_record["fit_mode"],
                 "best_n_intermediates": best_record["n_intermediates"],
@@ -3047,7 +3176,14 @@ class StoppedFlowApp:
         self.input_csv_var = tk.StringVar(value=cfg.input_csv)
         self.output_parent_var = tk.StringVar(value=cfg.output_parent)
         self.output_folder_name_var = tk.StringVar(value=cfg.output_folder_name)
-        self.E0_uM_var = tk.StringVar(value=str(cfg.E0_uM))
+        self.input_time_unit_var = tk.StringVar(value=getattr(cfg, "input_time_unit", "minutes"))
+        self.E0_unit_var = tk.StringVar(value=getattr(cfg, "enzyme_concentration_unit", "µM"))
+        self.substrate_unit_var = tk.StringVar(value=getattr(cfg, "substrate_concentration_unit", "µM"))
+        self._last_E0_unit = self.E0_unit_var.get()
+        self._last_substrate_unit = self.substrate_unit_var.get()
+        self.E0_uM_var = tk.StringVar(
+            value=str(cfg.concentration_from_uM(cfg.E0_uM, self.E0_unit_var.get()))
+        )
         self.num_concentrations_var = tk.IntVar(value=len(cfg.concentration_groups))
         self.use_default_params_var = tk.BooleanVar(value=True)
         self.analysis_mode_var = tk.StringVar(value=cfg.analysis_mode)
@@ -3068,7 +3204,7 @@ class StoppedFlowApp:
         subtitle = ttk.Label(
             container,
             text=(
-                "Choose your CSV, define concentrations, select an analysis mode, "
+                "Choose your CSV, define time and concentration units, select an analysis mode, "
                 "or unlock custom parameters for full control."
             ),
             style="Hint.TLabel",
@@ -3131,10 +3267,54 @@ class StoppedFlowApp:
             row=6, column=0, columnspan=3, sticky="w", pady=(0, 8)
         )
 
-        ttk.Label(frame, text="Initial enzyme E0 (µM)").grid(row=7, column=0, sticky="w", pady=5)
-        ttk.Entry(frame, textvariable=self.E0_uM_var, width=14).grid(row=7, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(frame, text="CSV time unit").grid(row=7, column=0, sticky="w", pady=5)
+        time_combo = ttk.Combobox(
+            frame,
+            textvariable=self.input_time_unit_var,
+            values=GUI_TIME_UNITS,
+            state="readonly",
+            width=12,
+        )
+        time_combo.grid(row=7, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(
+            frame,
+            text="Input time is converted internally to minutes; fitted rate constants remain in min-based units.",
+            style="Hint.TLabel",
+            wraplength=650,
+        ).grid(row=7, column=2, sticky="w", padx=5, pady=5)
 
-        ttk.Label(frame, text="Number of concentrations").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Initial enzyme E0").grid(row=8, column=0, sticky="w", pady=5)
+        e0_frame = ttk.Frame(frame)
+        e0_frame.grid(row=8, column=1, sticky="w", padx=5, pady=5)
+        ttk.Entry(e0_frame, textvariable=self.E0_uM_var, width=14).pack(side="left")
+        e0_unit_combo = ttk.Combobox(
+            e0_frame,
+            textvariable=self.E0_unit_var,
+            values=GUI_CONCENTRATION_UNITS,
+            state="readonly",
+            width=7,
+        )
+        e0_unit_combo.pack(side="left", padx=(6, 0))
+        e0_unit_combo.bind("<<ComboboxSelected>>", self._on_e0_unit_changed)
+
+        ttk.Label(frame, text="Substrate/reactant concentration unit").grid(row=9, column=0, sticky="w", pady=5)
+        substrate_unit_combo = ttk.Combobox(
+            frame,
+            textvariable=self.substrate_unit_var,
+            values=GUI_CONCENTRATION_UNITS,
+            state="readonly",
+            width=10,
+        )
+        substrate_unit_combo.grid(row=9, column=1, sticky="w", padx=5, pady=5)
+        substrate_unit_combo.bind("<<ComboboxSelected>>", self._on_substrate_unit_changed)
+        ttk.Label(
+            frame,
+            text="nM, µM, mM, and M are accepted; ANCHOR converts concentrations internally to µM/mM.",
+            style="Hint.TLabel",
+            wraplength=650,
+        ).grid(row=9, column=2, sticky="w", padx=5, pady=5)
+
+        ttk.Label(frame, text="Number of concentrations").grid(row=10, column=0, sticky="w", pady=5)
         concentration_spin = ttk.Spinbox(
             frame,
             from_=1,
@@ -3143,31 +3323,30 @@ class StoppedFlowApp:
             width=8,
             command=self._refresh_concentration_rows,
         )
-        concentration_spin.grid(row=8, column=1, sticky="w", padx=5, pady=5)
+        concentration_spin.grid(row=10, column=1, sticky="w", padx=5, pady=5)
         ttk.Button(frame, text="Apply count", command=self._refresh_concentration_rows).grid(
-            row=8, column=2, sticky="ew", pady=5
+            row=10, column=2, sticky="ew", pady=5
         )
 
+        self.concentration_assignment_hint_var = tk.StringVar()
+        self._update_concentration_hint()
         ttk.Label(
             frame,
-            text=(
-                "Trace columns are assigned in order. Example: if 50 µM has 9 samples "
-                "and 200 µM has 9 samples, columns 2-10 are 50 µM and columns 11-19 are 200 µM."
-            ),
+            textvariable=self.concentration_assignment_hint_var,
             style="Hint.TLabel",
             wraplength=850,
-        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 8))
 
         self.conc_container = ttk.Frame(frame)
-        self.conc_container.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.conc_container.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         self.conc_container.columnconfigure(1, weight=1)
 
         ttk.Label(frame, textvariable=self.expected_traces_var, style="Hint.TLabel").grid(
-            row=11, column=0, columnspan=3, sticky="w", pady=(4, 12)
+            row=13, column=0, columnspan=3, sticky="w", pady=(4, 12)
         )
 
         ttk.Button(frame, text="Next: fitting parameters", command=lambda: self.notebook.select(self.params_tab)).grid(
-            row=12, column=2, sticky="e", pady=18
+            row=14, column=2, sticky="e", pady=18
         )
 
         for var in (self.output_parent_var, self.output_folder_name_var):
@@ -3483,6 +3662,52 @@ class StoppedFlowApp:
     def _update_output_preview(self) -> None:
         self.output_preview_var.set(self._output_preview_text())
 
+    def _update_concentration_hint(self) -> None:
+        if not hasattr(self, "concentration_assignment_hint_var"):
+            return
+        unit = self.substrate_unit_var.get() or "µM"
+        self.concentration_assignment_hint_var.set(
+            "Trace columns are assigned in order. Example: if the first concentration has 9 samples "
+            f"and the second has 9 samples, columns 2-10 use the first {unit} value and columns "
+            f"11-19 use the second {unit} value."
+        )
+
+    @staticmethod
+    def _format_unit_value(value: float) -> str:
+        if not np.isfinite(value):
+            return str(value)
+        return f"{value:.12g}"
+
+    def _on_e0_unit_changed(self, _event: Optional[tk.Event] = None) -> None:
+        new_unit = self.E0_unit_var.get() or "µM"
+        old_unit = getattr(self, "_last_E0_unit", new_unit)
+        if new_unit == old_unit:
+            return
+        try:
+            value = float(self.E0_uM_var.get())
+            value_uM = FittingConfig.concentration_to_uM(value, old_unit)
+            converted = FittingConfig.concentration_from_uM(value_uM, new_unit)
+            self.E0_uM_var.set(self._format_unit_value(converted))
+        except (ValueError, TypeError):
+            pass
+        self._last_E0_unit = new_unit
+
+    def _on_substrate_unit_changed(self, _event: Optional[tk.Event] = None) -> None:
+        new_unit = self.substrate_unit_var.get() or "µM"
+        old_unit = getattr(self, "_last_substrate_unit", new_unit)
+        if new_unit != old_unit:
+            for row_info in self.concentration_rows:
+                try:
+                    value = float(row_info["conc_var"].get())
+                    value_uM = FittingConfig.concentration_to_uM(value, old_unit)
+                    converted = FittingConfig.concentration_from_uM(value_uM, new_unit)
+                    row_info["conc_var"].set(self._format_unit_value(converted))
+                except (ValueError, TypeError):
+                    pass
+        self._last_substrate_unit = new_unit
+        self._refresh_concentration_rows()
+        self._update_concentration_hint()
+
     def _refresh_concentration_rows(self) -> None:
         try:
             n = int(self.num_concentrations_var.get())
@@ -3499,9 +3724,10 @@ class StoppedFlowApp:
             child.destroy()
 
         self.concentration_rows = []
+        unit = self.substrate_unit_var.get() or "µM"
 
         ttk.Label(self.conc_container, text="#", style="Subheader.TLabel").grid(row=0, column=0, sticky="w", padx=4)
-        ttk.Label(self.conc_container, text="Concentration (µM)", style="Subheader.TLabel").grid(
+        ttk.Label(self.conc_container, text="Concentration", style="Subheader.TLabel").grid(
             row=0, column=1, sticky="w", padx=4
         )
         ttk.Label(self.conc_container, text="Number of samples/traces", style="Subheader.TLabel").grid(
@@ -3513,9 +3739,12 @@ class StoppedFlowApp:
                 conc_value, sample_value = old_values[idx]
             elif idx < len(DEFAULT_CONFIG.concentration_groups):
                 group = DEFAULT_CONFIG.concentration_groups[idx]
-                conc_value, sample_value = str(group.concentration_uM), str(group.n_samples)
+                display_value = FittingConfig.concentration_from_uM(group.concentration_uM, unit)
+                conc_value, sample_value = self._format_unit_value(display_value), str(group.n_samples)
             else:
-                conc_value, sample_value = str(50.0 * (idx + 1)), "1"
+                default_uM = 50.0 * (idx + 1)
+                display_value = FittingConfig.concentration_from_uM(default_uM, unit)
+                conc_value, sample_value = self._format_unit_value(display_value), "1"
 
             conc_var = tk.StringVar(value=conc_value)
             sample_var = tk.StringVar(value=sample_value)
@@ -3533,6 +3762,7 @@ class StoppedFlowApp:
             self.concentration_rows.append({"conc_var": conc_var, "sample_var": sample_var})
 
         self._update_expected_traces()
+        self._update_concentration_hint()
 
     def _update_expected_traces(self) -> None:
         total = 0
@@ -3604,15 +3834,20 @@ class StoppedFlowApp:
         cfg.input_csv = self.input_csv_var.get().strip()
         cfg.output_parent = self.output_parent_var.get().strip()
         cfg.output_folder_name = self.output_folder_name_var.get().strip()
-        cfg.E0_uM = self._parse_float(self.E0_uM_var.get(), "Initial enzyme E0")
+        cfg.input_time_unit = self.input_time_unit_var.get().strip().lower()
+        cfg.enzyme_concentration_unit = FittingConfig.normalize_concentration_unit(self.E0_unit_var.get())
+        cfg.substrate_concentration_unit = FittingConfig.normalize_concentration_unit(self.substrate_unit_var.get())
+        E0_display = self._parse_float(self.E0_uM_var.get(), "Initial enzyme E0")
+        cfg.E0_uM = FittingConfig.concentration_to_uM(E0_display, cfg.enzyme_concentration_unit)
         cfg.analysis_mode = self.analysis_mode_var.get()
         cfg.fit_michaelis_menten = bool(self.fit_michaelis_menten_var.get())
 
         groups: List[ConcentrationGroup] = []
         for idx, row_info in enumerate(self.concentration_rows, start=1):
-            conc = self._parse_float(row_info["conc_var"].get(), f"Concentration {idx}")
+            conc_display = self._parse_float(row_info["conc_var"].get(), f"Concentration {idx}")
+            conc_uM = FittingConfig.concentration_to_uM(conc_display, cfg.substrate_concentration_unit)
             samples = self._parse_int(row_info["sample_var"].get(), f"Sample count {idx}")
-            groups.append(ConcentrationGroup(conc, samples))
+            groups.append(ConcentrationGroup(conc_uM, samples))
         cfg.concentration_groups = groups
 
         if not self.use_default_params_var.get():
@@ -3640,7 +3875,30 @@ class StoppedFlowApp:
         self.input_csv_var.set(cfg.input_csv)
         self.output_parent_var.set(cfg.output_parent)
         self.output_folder_name_var.set(cfg.output_folder_name)
-        self.E0_uM_var.set(str(cfg.E0_uM))
+
+        time_unit = str(getattr(cfg, "input_time_unit", "minutes") or "minutes").lower()
+        e0_unit = FittingConfig.normalize_concentration_unit(
+            getattr(cfg, "enzyme_concentration_unit", "µM")
+        )
+        substrate_unit = FittingConfig.normalize_concentration_unit(
+            getattr(cfg, "substrate_concentration_unit", "µM")
+        )
+        if time_unit not in GUI_TIME_UNITS:
+            time_unit = "minutes"
+        if e0_unit not in GUI_CONCENTRATION_UNITS:
+            e0_unit = "µM"
+        if substrate_unit not in GUI_CONCENTRATION_UNITS:
+            substrate_unit = "µM"
+
+        self.input_time_unit_var.set(time_unit)
+        self.E0_unit_var.set(e0_unit)
+        self.substrate_unit_var.set(substrate_unit)
+        self._last_E0_unit = e0_unit
+        self._last_substrate_unit = substrate_unit
+        self.E0_uM_var.set(
+            self._format_unit_value(FittingConfig.concentration_from_uM(cfg.E0_uM, e0_unit))
+        )
+
         self.analysis_mode_var.set(getattr(cfg, "analysis_mode", "general_auto"))
         if hasattr(self, "fit_michaelis_menten_var"):
             self.fit_michaelis_menten_var.set(bool(getattr(cfg, "fit_michaelis_menten", True)))
@@ -3654,7 +3912,7 @@ class StoppedFlowApp:
         self.concentration_rows = []
 
         ttk.Label(self.conc_container, text="#", style="Subheader.TLabel").grid(row=0, column=0, sticky="w", padx=4)
-        ttk.Label(self.conc_container, text="Concentration (µM)", style="Subheader.TLabel").grid(
+        ttk.Label(self.conc_container, text="Concentration", style="Subheader.TLabel").grid(
             row=0, column=1, sticky="w", padx=4
         )
         ttk.Label(self.conc_container, text="Number of samples/traces", style="Subheader.TLabel").grid(
@@ -3662,7 +3920,8 @@ class StoppedFlowApp:
         )
 
         for idx, group in enumerate(cfg.concentration_groups):
-            conc_var = tk.StringVar(value=str(group.concentration_uM))
+            display_value = FittingConfig.concentration_from_uM(group.concentration_uM, substrate_unit)
+            conc_var = tk.StringVar(value=self._format_unit_value(display_value))
             sample_var = tk.StringVar(value=str(group.n_samples))
             conc_var.trace_add("write", lambda *_: self._update_expected_traces())
             sample_var.trace_add("write", lambda *_: self._update_expected_traces())
@@ -3685,6 +3944,7 @@ class StoppedFlowApp:
 
         self.use_default_params_var.set(bool(use_default_params))
         self._update_expected_traces()
+        self._update_concentration_hint()
         self._update_output_preview()
         self._toggle_advanced_state()
 
